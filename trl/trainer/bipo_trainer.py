@@ -44,7 +44,13 @@ from transformers.models.auto.modeling_auto import MODEL_FOR_VISION_2_SEQ_MAPPIN
 from transformers.trainer_callback import TrainerCallback
 from transformers.trainer_utils import EvalLoopOutput, speed_metrics
 from transformers.debug_utils import DebugOption
-from transformers.utils import is_torch_tpu_available
+try:
+    # Older Transformers exposed this helper from transformers.utils
+    from transformers.utils import is_torch_tpu_available  # type: ignore
+except Exception:
+    # Newer Transformers may remove/move this. This project targets GPU runs.
+    def is_torch_tpu_available() -> bool:  # type: ignore
+        return False
 
 from ..import_utils import is_peft_available, is_wandb_available
 from ..models import PreTrainedModelWrapper, create_reference_model
@@ -1454,6 +1460,7 @@ class BiPOTrainer(Trainer):
         self,
         model: Union[PreTrainedModel, nn.Module],
         inputs: Dict[str, Union[torch.Tensor, Any]],
+        num_items_in_batch: Optional[torch.Tensor] = None,
         return_outputs=False,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, Dict[str, torch.Tensor]]]:
         if not self.use_dpo_data_collator:
@@ -1476,7 +1483,21 @@ class BiPOTrainer(Trainer):
             return (loss, metrics)
         return loss
 
-    def get_batch_samples(self, model, batch: Dict[str, torch.LongTensor]) -> Tuple[str, str]:
+    def get_batch_samples(self, epoch_iterator, num_batches, device=None):
+        """Compatibility shim for `transformers.Trainer`.
+
+        Newer versions of `transformers` call `Trainer.get_batch_samples(epoch_iterator, num_batches, device)`
+        inside the training loop. BiPO historically used the name `get_batch_samples` for generation, which
+        accidentally overrides the Trainer method and crashes training.
+        """
+
+        try:
+            return super().get_batch_samples(epoch_iterator, num_batches, device)
+        except TypeError:
+            # Older `transformers` may not pass `device`.
+            return super().get_batch_samples(epoch_iterator, num_batches)
+
+    def get_generation_samples(self, model, batch: Dict[str, torch.LongTensor]) -> Tuple[str, str]:
         """Generate samples from the model and reference model for the given batch of inputs."""
 
         # If one uses `generate_during_eval` with peft + bf16, we need to explicitly call generate with
@@ -1603,7 +1624,7 @@ class BiPOTrainer(Trainer):
             random_batch = self.data_collator(random_batch_dataset)
             random_batch = self._prepare_inputs(random_batch)
 
-            policy_output_decoded, ref_output_decoded = self.get_batch_samples(self.model, random_batch)
+            policy_output_decoded, ref_output_decoded = self.get_generation_samples(self.model, random_batch)
 
             self.log(
                 {
@@ -1733,7 +1754,7 @@ class BiPOTrainer(Trainer):
 
         return output.metrics
 
-    def log(self, logs: Dict[str, float]) -> None:
+    def log(self, logs: Dict[str, float], *args, **kwargs) -> None:
         """
         Log `logs` on the various objects watching training, including stored metrics.
 
@@ -1747,7 +1768,7 @@ class BiPOTrainer(Trainer):
         for key, metrics in self._stored_metrics[train_eval].items():
             logs[key] = torch.tensor(metrics).mean().item()
         del self._stored_metrics[train_eval]
-        return super().log(logs)
+        return super().log(logs, *args, **kwargs)
 
     @wraps(Trainer.push_to_hub)
     def push_to_hub(self, commit_message: Optional[str] = "End of training", blocking: bool = True, **kwargs) -> str:

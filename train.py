@@ -11,7 +11,7 @@ from peft import LoraConfig
 from transformers import AutoModelForCausalLM, AutoTokenizer, HfArgumentParser, TrainingArguments
 
 from trl import BiPOTrainer, DPOConfig
-from fastchat.conversation import get_conv_template
+
 
 SYSTEM_PROMPT = "You are a helpful, honest and concise assistant."
 
@@ -38,15 +38,16 @@ def print_trainable_parameters(model):
     )
 
 class BlockWrapper(torch.nn.Module):
-    def __init__(self, block, vec=None):
+    def __init__(self, block, vec=None, hidden_size: Optional[int] = None):
         super().__init__()
         self.multiplier = 1.0
         self.block = block
         if vec is not None:
             self.vec = torch.nn.Parameter(vec)
         else:
-            # Zero Init
-            self.vec = torch.nn.Parameter(torch.zeros(4096))
+            if hidden_size is None:
+                raise ValueError("hidden_size must be provided when vec is None")
+            self.vec = torch.nn.Parameter(torch.zeros(hidden_size))
 
     def forward(self, *args, **kwargs):
         output = self.block(*args, **kwargs)
@@ -70,7 +71,7 @@ class ScriptArguments:
     # training parameters
     model_name_or_path: Optional[str] = field(
         default="meta-llama/Llama-2-7b-chat-hf",
-        metadata={"help": "we only support meta-llama/Llama-2-7b-chat-hf and mistralai/Mistral-7B-Instruct-v0.2"},
+        metadata={"help": "HF model id, e.g. meta-llama/Llama-3.1-8B-Instruct"},
     )
     learning_rate: Optional[float] = field(default=5e-4, metadata={"help": "optimizer learning rate"})
     lr_scheduler_type: Optional[str] = field(default="cosine", metadata={"help": "the lr scheduler type"})
@@ -97,6 +98,15 @@ class ScriptArguments:
     behavior: Optional[str] = field(default="power-seeking", metadata={"help": "the behavior"})
     layer: Optional[int] = field(default=15, metadata={"help": "the layer the steering vector extracted from"})
 
+    train_file: Optional[str] = field(
+        default=None,
+        metadata={"help": "Path to training CSV (defaults to ./data/{behavior}/train.csv)"},
+    )
+    eval_file: Optional[str] = field(
+        default=None,
+        metadata={"help": "Path to eval CSV (defaults to ./data/{behavior}/test.csv)"},
+    )
+
     # instrumentation
     report_to: Optional[str] = field(
         default="none",
@@ -116,20 +126,33 @@ class ScriptArguments:
         },
     )
 
-def get_data(num_proc=1, behavior='power-seeking', train=True, template_name='llama-2'):
-    if train:
-        dataset = load_dataset("csv", data_files=f"./data/{behavior}/train.csv", split='train')
-    else:
-        dataset = load_dataset("csv", data_files=f"./data/{behavior}/test.csv", split='train')
+def _build_prompt(tokenizer: AutoTokenizer, question: str) -> str:
+    """Build a chat-formatted prompt using the tokenizer's chat_template when available."""
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": question},
+    ]
+    try:
+        return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    except Exception:
+        # Fallback: a minimal, model-agnostic format.
+        return f"{SYSTEM_PROMPT}\n\nUser: {question}\nAssistant:"
+
+
+def get_data(
+    tokenizer: AutoTokenizer,
+    num_proc=1,
+    behavior: str = "power-seeking",
+    data_file: Optional[str] = None,
+):
+    if data_file is None:
+        raise ValueError("data_file must be provided")
+    dataset = load_dataset("csv", data_files=data_file, split="train")
     original_columns = dataset.column_names
     def return_prompt_and_responses(samples) -> Dict[str, str]:
         prompt = []
         for question in samples["question"]:
-            conv = get_conv_template(template_name)
-            conv.set_system_message(SYSTEM_PROMPT)
-            conv.append_message(conv.roles[0], question)
-            conv.append_message(conv.roles[1], None)
-            prompt.append(conv.get_prompt())
+            prompt.append(_build_prompt(tokenizer, question))
         return {
             "prompt": prompt,
             "chosen": [' ' + s for s in samples["matching"]],
@@ -147,20 +170,45 @@ if __name__ == "__main__":
     parser = HfArgumentParser(ScriptArguments)
     script_args = parser.parse_args_into_dataclasses()[0]
     set_seed(seed=11)
-    if script_args.model_name_or_path not in ['meta-llama/Llama-2-7b-chat-hf', 'mistralai/Mistral-7B-Instruct-v0.2']:
-        print(f'{script_args.model_name_or_path} is not in supported model list. We support meta-llama/Llama-2-7b-chat-hf and mistralai/Mistral-7B-Instruct-v0.2')
-    if script_args.model_name_or_path == 'meta-llama/Llama-2-7b-chat-hf':
-        template_name = 'llama-2'
-    elif script_args.model_name_or_path == 'mistralai/Mistral-7B-Instruct-v0.2':
-        template_name = 'mistral'
-    print('[Behavior:] ', script_args.behavior, '[Layer:] ', script_args.layer, '[Model:] ', script_args.model_name_or_path)
+
+    print('[Behavior:] ', script_args.behavior, '[Layer (0-index):] ', script_args.layer, '[Model:] ', script_args.model_name_or_path)
+
+    hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
+
+    # Load tokenizer first so we can build prompts without fastchat.
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(script_args.model_name_or_path, token=hf_token)
+    except TypeError:
+        tokenizer = AutoTokenizer.from_pretrained(script_args.model_name_or_path, use_auth_token=hf_token)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
 
     # 1. load a pretrained model
-    model = AutoModelForCausalLM.from_pretrained(
-        script_args.model_name_or_path,
-        low_cpu_mem_usage=True,
+    torch_dtype = None
+    if torch.cuda.is_available():
+        # Prefer bf16 on Ampere+ (CC >= 8.0); fall back to fp16 otherwise.
+        major_cc, _minor_cc = torch.cuda.get_device_capability()
+        torch_dtype = torch.bfloat16 if major_cc >= 8 else torch.float16
+
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
+            script_args.model_name_or_path,
+            low_cpu_mem_usage=True,
+            torch_dtype=torch_dtype,
+            token=hf_token,
+        )
+    except TypeError:
+        model = AutoModelForCausalLM.from_pretrained(
+            script_args.model_name_or_path,
+            low_cpu_mem_usage=True,
+            torch_dtype=torch_dtype,
+            use_auth_token=hf_token,
+        )
+
+    model.model.layers[script_args.layer] = BlockWrapper(
+        model.model.layers[script_args.layer],
+        hidden_size=getattr(model.config, "hidden_size", 4096),
     )
-    model.model.layers[script_args.layer] = BlockWrapper(model.model.layers[script_args.layer])
     model.config.use_cache = False
 
     if script_args.ignore_bias_buffers:
@@ -169,14 +217,22 @@ if __name__ == "__main__":
             name for name, buffer in model.named_buffers() if buffer.dtype == torch.bool
         ]
 
-    model_ref = AutoModelForCausalLM.from_pretrained(
-        script_args.model_name_or_path,
-        low_cpu_mem_usage=True,
-    )
+    try:
+        model_ref = AutoModelForCausalLM.from_pretrained(
+            script_args.model_name_or_path,
+            low_cpu_mem_usage=True,
+            torch_dtype=torch_dtype,
+            token=hf_token,
+        )
+    except TypeError:
+        model_ref = AutoModelForCausalLM.from_pretrained(
+            script_args.model_name_or_path,
+            low_cpu_mem_usage=True,
+            torch_dtype=torch_dtype,
+            use_auth_token=hf_token,
+        )
     print('-----------------------------')
     print(script_args.model_name_or_path)
-    tokenizer = AutoTokenizer.from_pretrained(script_args.model_name_or_path)
-    tokenizer.pad_token = tokenizer.eos_token
 
     for name, param in model_ref.named_parameters():
         param.requires_grad = False
@@ -188,10 +244,12 @@ if __name__ == "__main__":
     print('Finish loading pre-trained models...')
 
     # 2. Load training dataset
-    train_dataset = get_data(behavior=script_args.behavior, train=True, template_name=template_name) 
+    train_file = script_args.train_file or f"./data/{script_args.behavior}/train.csv"
+    train_dataset = get_data(tokenizer=tokenizer, behavior=script_args.behavior, data_file=train_file)
 
     # 3. Load val dataset
-    test_dataset = get_data(behavior=script_args.behavior, train=False, template_name=template_name) 
+    eval_file = script_args.eval_file or f"./data/{script_args.behavior}/test.csv"
+    test_dataset = get_data(tokenizer=tokenizer, behavior=script_args.behavior, data_file=eval_file)
     
     # 4. initialize training arguments:
     training_args = DPOConfig(
@@ -216,6 +274,8 @@ if __name__ == "__main__":
     )
 
    # 5. initialize the DPO trainer
+    # Keep the vector output naming stable and filesystem-safe.
+    model_tag = script_args.model_name_or_path.split("/")[-1].lower().replace("_", "-")
     dpo_trainer = BiPOTrainer(
         model,
         ref_model=model_ref,
@@ -226,7 +286,7 @@ if __name__ == "__main__":
         tokenizer=tokenizer,
         behavior=script_args.behavior,
         layer=script_args.layer,
-        name=template_name,
+        name=model_tag,
     )
 
     # 6. Start training
